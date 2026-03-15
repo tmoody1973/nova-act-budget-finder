@@ -22,6 +22,23 @@ FIND_BUDGET_SECRET = os.environ.get("FIND_BUDGET_SECRET", "")
 # Thread pool for running Nova Act (sync Playwright) outside asyncio loop
 executor = ThreadPoolExecutor(max_workers=2)
 
+# Known budget page patterns for Wisconsin cities
+# Nova Act navigates these directly instead of searching Google (avoids CAPTCHA)
+KNOWN_BUDGET_PAGES: dict[str, str] = {
+    "green bay": "https://www.greenbaywi.gov/Archive.aspx?AMID=36",
+    "madison": "https://www.cityofmadison.com/finance/budget",
+    "racine": "https://www.racine-county.com/departments/finance",
+    "kenosha": "https://www.kenosha.org/departments/finance",
+    "appleton": "https://www.appleton.org/government/finance",
+    "eau claire": "https://www.eauclairewi.gov/government/departments-divisions/finance",
+    "oshkosh": "https://www.ci.oshkosh.wi.us/Finance/",
+    "janesville": "https://www.janesvillewi.gov/departments/finance",
+    "waukesha": "https://www.waukesha-wi.gov/departments/finance/",
+}
+
+# Wisconsin Policy Forum publishes budget briefs
+WPF_SEARCH_URL = "https://wispolicyforum.org/?s={query}&post_type=research"
+
 
 class FindBudgetRequest(BaseModel):
     city: str
@@ -59,92 +76,32 @@ def run_nova_act_search(city: str, state: str) -> dict:
     """Run Nova Act browser search in a separate thread (sync Playwright)."""
     steps: list[str] = []
     results: list[dict] = []
+    city_lower = city.lower().strip()
 
-    search_query = f"{city} {state} city budget 2025 2026 PDF site:.gov"
-    steps.append(f"Searching Google for '{search_query}'")
+    # Strategy 1: Check if we have a known budget page URL
+    known_url = KNOWN_BUDGET_PAGES.get(city_lower)
 
-    with NovaAct(starting_page="https://www.google.com", headless=True) as nova:
-        nova.act(
-            f"Search for: {search_query}. "
-            f"Type the query into the search box and press Enter."
-        )
-        steps.append("Google search complete")
+    if known_url:
+        steps.append(f"Found known budget page for {city}: {known_url}")
+        target_url = known_url
+    else:
+        # Strategy 2: Search Wisconsin Policy Forum
+        steps.append(f"No known budget page for {city}. Searching Wisconsin Policy Forum...")
+        target_url = WPF_SEARCH_URL.format(query=f"budget+brief+{city.replace(' ', '+')}")
 
-        # Extract top government results
-        search_results = nova.act(
-            "Look at the search results. Find the top 3 results that link to "
-            "government websites (.gov) related to city or municipal budgets. "
-            "Return each result's title and URL.",
-            schema={
-                "type": "object",
-                "properties": {
-                    "results": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "title": {"type": "string"},
-                                "url": {"type": "string"},
-                            },
-                            "required": ["title", "url"],
-                        },
-                    }
-                },
-                "required": ["results"],
-            },
-        )
+    # Use Nova Act to navigate and extract PDF links
+    steps.append(f"Opening browser and navigating to: {target_url}")
 
-        gov_urls = []
-        if search_results.matches_schema and search_results.parsed_response:
-            gov_urls = search_results.parsed_response.get("results", [])
-            steps.append(f"Found {len(gov_urls)} government website results")
-
-        # Fallback: try Wisconsin Policy Forum
-        if not gov_urls:
-            fallback_query = f"site:wispolicyforum.org budget brief {city}"
-            steps.append(f"No .gov results. Trying: '{fallback_query}'")
-            nova.act(f"Search for: {fallback_query}")
-
-            fallback_results = nova.act(
-                "Find any results linking to PDF budget briefs. "
-                "Return the title and URL for each.",
-                schema={
-                    "type": "object",
-                    "properties": {
-                        "results": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "title": {"type": "string"},
-                                    "url": {"type": "string"},
-                                },
-                                "required": ["title", "url"],
-                            },
-                        }
-                    },
-                    "required": ["results"],
-                },
-            )
-            if fallback_results.matches_schema and fallback_results.parsed_response:
-                gov_urls = fallback_results.parsed_response.get("results", [])
-                steps.append(f"Found {len(gov_urls)} Wisconsin Policy Forum results")
-
-        if not gov_urls:
-            steps.append("No budget documents found")
-            return {"steps": steps, "results": [], "error": None}
-
-        # Navigate to the best result
-        target_url = gov_urls[0]["url"]
-        steps.append(f"Navigating to: {target_url}")
-        nova.act(f"Navigate to {target_url}")
+    with NovaAct(starting_page=target_url, headless=True) as nova:
+        steps.append("Page loaded. Looking for budget PDF links...")
 
         # Extract PDF links from the page
         pdf_extraction = nova.act(
-            "Look at this page and find all links to PDF documents related to "
-            "budgets, financial reports, or budget summaries. "
-            "Return the title/text of each link and its full URL. "
-            "Only include links that end in .pdf or are clearly PDF downloads.",
+            f"Look at this page carefully. Find all links to PDF documents related to "
+            f"budgets, financial reports, budget summaries, or budget briefs for {city}. "
+            f"Also look for links that say 'download', 'view PDF', or 'budget document'. "
+            f"Return the title/text of each link and its full URL. "
+            f"Include links that end in .pdf or point to document downloads.",
             schema={
                 "type": "object",
                 "properties": {
@@ -169,22 +126,62 @@ def run_nova_act_search(city: str, state: str) -> dict:
             steps.append(f"Found {len(pdf_links)} PDF links on the page")
 
             for link in pdf_links[:5]:
+                url = link.get("url", "")
                 results.append({
                     "title": link.get("title", "Budget Document"),
-                    "url": link.get("url", ""),
+                    "url": url,
                     "source_page": target_url,
-                    "file_type": "pdf",
+                    "file_type": "pdf" if url.lower().endswith(".pdf") else "page",
                 })
         else:
             steps.append("Could not extract PDF links from the page")
-            for r in gov_urls[:3]:
-                results.append({
-                    "title": r.get("title", "Budget Page"),
-                    "url": r.get("url", ""),
-                    "source_page": "google.com",
-                    "file_type": "page",
-                })
-            steps.append("Returning search result URLs instead")
+
+        # If no PDFs found on known page, try navigating deeper
+        if not results and known_url:
+            steps.append("No PDFs found on main page. Looking for budget subpages...")
+            nova.act(
+                f"Look for any links on this page that contain the word 'budget' "
+                f"and click on the most relevant one."
+            )
+
+            # Try extraction again on the subpage
+            pdf_extraction_2 = nova.act(
+                "Find all PDF links on this page related to budgets or financial documents. "
+                "Return the title and URL for each.",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "pdf_links": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "title": {"type": "string"},
+                                    "url": {"type": "string"},
+                                },
+                                "required": ["title", "url"],
+                            },
+                        }
+                    },
+                    "required": ["pdf_links"],
+                },
+            )
+
+            if pdf_extraction_2.matches_schema and pdf_extraction_2.parsed_response:
+                pdf_links = pdf_extraction_2.parsed_response.get("pdf_links", [])
+                steps.append(f"Found {len(pdf_links)} PDF links on subpage")
+
+                for link in pdf_links[:5]:
+                    url = link.get("url", "")
+                    results.append({
+                        "title": link.get("title", "Budget Document"),
+                        "url": url,
+                        "source_page": target_url,
+                        "file_type": "pdf" if url.lower().endswith(".pdf") else "page",
+                    })
+
+    if not results:
+        steps.append(f"No budget PDFs found for {city}, {state}")
 
     return {"steps": steps, "results": results, "error": None}
 
