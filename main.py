@@ -97,11 +97,11 @@ def run_nova_act_search(city: str, state: str) -> dict:
 
         # Extract PDF links from the page
         pdf_extraction = nova.act(
-            f"Look at this page carefully. Find all links to PDF documents related to "
-            f"budgets, financial reports, budget summaries, or budget briefs for {city}. "
-            f"Also look for links that say 'download', 'view PDF', or 'budget document'. "
-            f"Return the title/text of each link and its full URL. "
-            f"Include links that end in .pdf or point to document downloads.",
+            f"Look at this page carefully. Find all links related to budget documents for {city}. "
+            f"IMPORTANT: Return the ACTUAL href attribute from each link element, not a guessed URL. "
+            f"If the href is a relative path like '/Archive.aspx?ADID=728', combine it with the "
+            f"base URL to make a full URL like 'https://www.greenbaywi.gov/Archive.aspx?ADID=728'. "
+            f"Return the visible link text as the title and the real href URL.",
             schema={
                 "type": "object",
                 "properties": {
