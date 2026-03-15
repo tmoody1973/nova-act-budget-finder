@@ -373,7 +373,8 @@ def run_analyze(url: str, city_hint: str) -> dict:
         else:
             raise ValueError("Could not parse JSON from Nova response")
 
-    data["id"] = f"nova-{int(asyncio.get_event_loop().time() * 1000)}"
+    import time as _time
+    data["id"] = f"nova-{int(_time.time() * 1000)}"
     data["extracted_from"] = pdf_name
     data["pdf_size_mb"] = round(size_mb, 1)
     data["departments"] = data.get("departments", [])
