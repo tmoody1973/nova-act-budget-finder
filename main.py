@@ -315,11 +315,16 @@ def run_analyze(url: str, city_hint: str) -> dict:
 
     size_mb = len(pdf_bytes) / (1024 * 1024)
 
-    # Extract filename from URL
+    # Extract filename from URL and sanitize for Bedrock
+    # Bedrock only allows: alphanumeric, whitespace, hyphens, parentheses, square brackets
+    import re
     pdf_name = url.split("/")[-1].split("?")[0]
     if not pdf_name or not pdf_name.endswith(".pdf"):
         pdf_name = "budget-document"
-    pdf_name = pdf_name.replace(".pdf", "")
+    pdf_name = pdf_name.replace(".pdf", "").replace("%20", " ")
+    pdf_name = re.sub(r"[^a-zA-Z0-9\s\-\(\)\[\]]", "", pdf_name).strip()
+    if not pdf_name:
+        pdf_name = "budget-document"
 
     prompt = EXTRACTION_PROMPT
     if city_hint:
