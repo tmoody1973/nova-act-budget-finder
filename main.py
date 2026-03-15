@@ -162,9 +162,13 @@ def run_nova_act_search(city: str, state: str) -> dict:
             if not title:
                 title = "Budget Document"
 
-            size = check_pdf_size(url)
-            if size:
-                title = f"{title} ({size})"
+            size_str = check_pdf_size(url)
+            if size_str:
+                size_mb = float(size_str.replace(" MB", ""))
+                if size_mb > 10:
+                    title = f"{title} ({size_str} - too large, use summary instead)"
+                else:
+                    title = f"{title} ({size_str})"
 
             results.append({
                 "title": title,
@@ -172,6 +176,9 @@ def run_nova_act_search(city: str, state: str) -> dict:
                 "source_page": target_url,
                 "file_type": "pdf" if url.lower().endswith(".pdf") else "page",
             })
+
+        # Sort: smaller files first (analyzable ones on top)
+        results.sort(key=lambda r: "(too large" in r["title"])
 
         # If no budget links found on the page, try clicking into a budget subpage
         if not results and known_url:
