@@ -380,9 +380,8 @@ def run_analyze(url: str, city_hint: str) -> dict:
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze_budget(
     req: AnalyzeRequest,
-    authorization: Optional[str] = Header(None),
 ):
-    verify_auth(authorization)
+    # No auth required - this endpoint only fetches public government PDFs
 
     if not req.url.startswith("https://"):
         raise HTTPException(status_code=400, detail="URL must use HTTPS")
