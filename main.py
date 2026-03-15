@@ -1,8 +1,12 @@
 import os
+import json
 import asyncio
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
+import boto3
+from botocore.exceptions import ClientError
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -246,5 +250,149 @@ async def find_budget(
             state=state,
             results=[],
             search_steps=[f"Error: {str(e)}"],
+            error=str(e),
+        )
+
+
+# ------------------------------------------------------------------ #
+# PDF Analysis endpoint (runs on Railway, no Vercel timeout)         #
+# ------------------------------------------------------------------ #
+
+EXTRACTION_PROMPT = """You are a municipal budget analyst. Extract structured budget data from this document.
+
+Return ONLY valid JSON matching this exact schema (no markdown, no explanation):
+
+{
+  "city": "<city or entity name>",
+  "state": "<state abbreviation>",
+  "fiscal_year": <year as integer>,
+  "total_budget": <total budget/expenditures in dollars as integer>,
+  "tax_rate_per_1000": <property tax rate per $1,000 assessed value as float, or null>,
+  "property_tax_levy": <total property tax levy in dollars as integer, or null>,
+  "departments": [
+    {
+      "name": "<department or functional area name>",
+      "category": "<one of: public_safety, infrastructure, community_services, government_ops, education, health_human_services, parks_recreation, debt_service, transit, other>",
+      "budget": <budget amount in dollars as integer>,
+      "percent_of_total": <percentage of total budget as float>
+    }
+  ],
+  "summary": "<2-3 sentence plain-language summary of this budget>"
+}
+
+Rules:
+- Extract EVERY department with a budget amount
+- Use exact dollar amounts. NEVER estimate.
+- If amounts are in thousands or millions, convert to full dollars
+- If a field is not found, use null"""
+
+
+class AnalyzeRequest(BaseModel):
+    url: str
+    city_hint: Optional[str] = None
+
+
+class AnalyzeResponse(BaseModel):
+    status: str
+    result: Optional[dict] = None
+    error: Optional[str] = None
+
+
+def run_analyze(url: str, city_hint: str) -> dict:
+    """Download PDF and send to Nova 2 Lite for document understanding."""
+    # Download the PDF
+    req = urllib.request.Request(url)
+    req.add_header("User-Agent", "BudgetCompass/1.0")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        pdf_bytes = resp.read()
+
+    size_mb = len(pdf_bytes) / (1024 * 1024)
+
+    # Extract filename from URL
+    pdf_name = url.split("/")[-1].split("?")[0]
+    if not pdf_name or not pdf_name.endswith(".pdf"):
+        pdf_name = "budget-document"
+    pdf_name = pdf_name.replace(".pdf", "")
+
+    prompt = EXTRACTION_PROMPT
+    if city_hint:
+        prompt += f"\n\nHint: This document is likely about {city_hint}."
+
+    bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
+
+    response = bedrock.converse(
+        modelId="us.amazon.nova-2-lite-v1:0",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"text": prompt},
+                    {
+                        "document": {
+                            "format": "pdf",
+                            "name": pdf_name,
+                            "source": {"bytes": pdf_bytes},
+                        }
+                    },
+                ],
+            }
+        ],
+        inferenceConfig={"maxTokens": 8192, "temperature": 0.1},
+    )
+
+    response_text = response["output"]["message"]["content"][0]["text"]
+
+    # Parse JSON
+    text = response_text.strip()
+    if text.startswith("```"):
+        first_nl = text.find("\n")
+        text = text[first_nl + 1:] if first_nl != -1 else text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    text = text.strip()
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start != -1 and end > start:
+            data = json.loads(text[start:end])
+        else:
+            raise ValueError("Could not parse JSON from Nova response")
+
+    data["id"] = f"nova-{int(asyncio.get_event_loop().time() * 1000)}"
+    data["extracted_from"] = pdf_name
+    data["pdf_size_mb"] = round(size_mb, 1)
+    data["departments"] = data.get("departments", [])
+    data["summary"] = data.get("summary", "Budget data extracted from PDF.")
+
+    return data
+
+
+@app.post("/analyze", response_model=AnalyzeResponse)
+async def analyze_budget(
+    req: AnalyzeRequest,
+    authorization: Optional[str] = Header(None),
+):
+    verify_auth(authorization)
+
+    if not req.url.startswith("https://"):
+        raise HTTPException(status_code=400, detail="URL must use HTTPS")
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            executor,
+            run_analyze,
+            req.url,
+            req.city_hint or "",
+        )
+
+        return AnalyzeResponse(status="success", result=result)
+
+    except Exception as e:
+        return AnalyzeResponse(
+            status="error",
             error=str(e),
         )
