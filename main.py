@@ -23,7 +23,6 @@ FIND_BUDGET_SECRET = os.environ.get("FIND_BUDGET_SECRET", "")
 executor = ThreadPoolExecutor(max_workers=2)
 
 # Known budget page patterns for Wisconsin cities
-# Nova Act navigates these directly instead of searching Google (avoids CAPTCHA)
 KNOWN_BUDGET_PAGES: dict[str, str] = {
     "green bay": "https://www.greenbaywi.gov/Archive.aspx?AMID=36",
     "madison": "https://www.cityofmadison.com/finance/budget",
@@ -36,7 +35,6 @@ KNOWN_BUDGET_PAGES: dict[str, str] = {
     "waukesha": "https://www.waukesha-wi.gov/departments/finance/",
 }
 
-# Wisconsin Policy Forum publishes budget briefs
 WPF_SEARCH_URL = "https://wispolicyforum.org/?s={query}&post_type=research"
 
 
@@ -62,7 +60,6 @@ class FindBudgetResponse(BaseModel):
 
 
 def verify_auth(authorization: Optional[str]) -> None:
-    """Verify the shared secret from the Vercel proxy."""
     if not FIND_BUDGET_SECRET:
         return
     if not authorization or not authorization.startswith("Bearer "):
@@ -70,6 +67,36 @@ def verify_auth(authorization: Optional[str]) -> None:
     token = authorization[7:]
     if token != FIND_BUDGET_SECRET:
         raise HTTPException(status_code=403, detail="Invalid token")
+
+
+def extract_links_from_dom(nova, base_url: str) -> list[dict]:
+    """Use Playwright page.evaluate() to extract REAL href attributes from the DOM.
+    This bypasses Nova Act's AI to avoid hallucinated URLs."""
+
+    # Run JavaScript directly in the browser to get all links
+    links = nova.page.evaluate("""() => {
+        const results = [];
+        const anchors = document.querySelectorAll('a[href]');
+        for (const a of anchors) {
+            const href = a.href;  // .href gives absolute URL
+            const text = a.textContent.trim();
+            // Only include links with budget/finance related text or PDF links
+            const lowerText = text.toLowerCase();
+            const lowerHref = href.toLowerCase();
+            if (
+                lowerText.includes('budget') ||
+                lowerText.includes('financial') ||
+                lowerText.includes('fiscal') ||
+                lowerHref.endsWith('.pdf') ||
+                lowerHref.includes('budget')
+            ) {
+                results.push({ title: text, url: href });
+            }
+        }
+        return results;
+    }""")
+
+    return links or []
 
 
 def run_nova_act_search(city: str, state: str) -> dict:
@@ -82,106 +109,68 @@ def run_nova_act_search(city: str, state: str) -> dict:
     known_url = KNOWN_BUDGET_PAGES.get(city_lower)
 
     if known_url:
-        steps.append(f"Found known budget page for {city}: {known_url}")
+        steps.append(f"Found known budget page for {city}")
         target_url = known_url
     else:
         # Strategy 2: Search Wisconsin Policy Forum
-        steps.append(f"No known budget page for {city}. Searching Wisconsin Policy Forum...")
+        steps.append(f"No known budget page. Searching Wisconsin Policy Forum...")
         target_url = WPF_SEARCH_URL.format(query=f"budget+brief+{city.replace(' ', '+')}")
 
-    # Use Nova Act to navigate and extract PDF links
-    steps.append(f"Opening browser and navigating to: {target_url}")
+    steps.append(f"Nova Act opening browser...")
+    steps.append(f"Navigating to {city} government website...")
 
     with NovaAct(starting_page=target_url, headless=True) as nova:
-        steps.append("Page loaded. Looking for budget PDF links...")
+        steps.append("Page loaded. Scanning for budget documents...")
 
-        # Extract PDF links from the page
-        pdf_extraction = nova.act(
-            f"Look at this page carefully. Find all links related to budget documents for {city}. "
-            f"IMPORTANT: Return the ACTUAL href attribute from each link element, not a guessed URL. "
-            f"If the href is a relative path like '/Archive.aspx?ADID=728', combine it with the "
-            f"base URL to make a full URL like 'https://www.greenbaywi.gov/Archive.aspx?ADID=728'. "
-            f"Return the visible link text as the title and the real href URL.",
-            schema={
-                "type": "object",
-                "properties": {
-                    "pdf_links": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "title": {"type": "string"},
-                                "url": {"type": "string"},
-                            },
-                            "required": ["title", "url"],
-                        },
-                    }
-                },
-                "required": ["pdf_links"],
-            },
-        )
+        # Use DOM extraction (real hrefs) instead of AI extraction (hallucinated)
+        pdf_links = extract_links_from_dom(nova, target_url)
+        steps.append(f"Found {len(pdf_links)} budget-related links on the page")
 
-        if pdf_extraction.matches_schema and pdf_extraction.parsed_response:
-            pdf_links = pdf_extraction.parsed_response.get("pdf_links", [])
-            steps.append(f"Found {len(pdf_links)} PDF links on the page")
+        for link in pdf_links[:8]:
+            url = link.get("url", "")
+            title = link.get("title", "Budget Document")
+            # Clean up titles (remove extra whitespace)
+            title = " ".join(title.split())
+            if not title:
+                title = "Budget Document"
 
-            for link in pdf_links[:5]:
-                url = link.get("url", "")
-                results.append({
-                    "title": link.get("title", "Budget Document"),
-                    "url": url,
-                    "source_page": target_url,
-                    "file_type": "pdf" if url.lower().endswith(".pdf") else "page",
-                })
-        else:
-            steps.append("Could not extract PDF links from the page")
+            results.append({
+                "title": title,
+                "url": url,
+                "source_page": target_url,
+                "file_type": "pdf" if url.lower().endswith(".pdf") else "page",
+            })
 
-        # If no PDFs found on known page, try navigating deeper
+        # If no budget links found on the page, try clicking into a budget subpage
         if not results and known_url:
-            steps.append("No PDFs found on main page. Looking for budget subpages...")
-            nova.act(
-                f"Look for any links on this page that contain the word 'budget' "
-                f"and click on the most relevant one."
-            )
+            steps.append("No budget PDFs on main page. Looking for budget subpage...")
+            try:
+                nova.act(
+                    f"Look for a link that says 'budget' or 'financial reports' and click it."
+                )
+                steps.append("Navigated to subpage. Extracting links...")
 
-            # Try extraction again on the subpage
-            pdf_extraction_2 = nova.act(
-                "Find all PDF links on this page related to budgets or financial documents. "
-                "Return the title and URL for each.",
-                schema={
-                    "type": "object",
-                    "properties": {
-                        "pdf_links": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "title": {"type": "string"},
-                                    "url": {"type": "string"},
-                                },
-                                "required": ["title", "url"],
-                            },
-                        }
-                    },
-                    "required": ["pdf_links"],
-                },
-            )
+                pdf_links = extract_links_from_dom(nova, target_url)
+                steps.append(f"Found {len(pdf_links)} links on subpage")
 
-            if pdf_extraction_2.matches_schema and pdf_extraction_2.parsed_response:
-                pdf_links = pdf_extraction_2.parsed_response.get("pdf_links", [])
-                steps.append(f"Found {len(pdf_links)} PDF links on subpage")
-
-                for link in pdf_links[:5]:
+                for link in pdf_links[:8]:
                     url = link.get("url", "")
+                    title = " ".join(link.get("title", "Budget Document").split())
+                    if not title:
+                        title = "Budget Document"
                     results.append({
-                        "title": link.get("title", "Budget Document"),
+                        "title": title,
                         "url": url,
                         "source_page": target_url,
                         "file_type": "pdf" if url.lower().endswith(".pdf") else "page",
                     })
+            except Exception as e:
+                steps.append(f"Could not navigate to subpage: {str(e)[:100]}")
 
     if not results:
         steps.append(f"No budget PDFs found for {city}, {state}")
+    else:
+        steps.append(f"Done! Found {len(results)} budget documents for {city}")
 
     return {"steps": steps, "results": results, "error": None}
 
@@ -205,7 +194,6 @@ async def find_budget(
         raise HTTPException(status_code=400, detail="city and state are required")
 
     try:
-        # Run Nova Act in a thread to avoid async/sync Playwright conflict
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             executor,
