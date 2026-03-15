@@ -73,14 +73,12 @@ def extract_links_from_dom(nova, base_url: str) -> list[dict]:
     """Use Playwright page.evaluate() to extract REAL href attributes from the DOM.
     This bypasses Nova Act's AI to avoid hallucinated URLs."""
 
-    # Run JavaScript directly in the browser to get all links
     links = nova.page.evaluate("""() => {
         const results = [];
         const anchors = document.querySelectorAll('a[href]');
         for (const a of anchors) {
-            const href = a.href;  // .href gives absolute URL
+            const href = a.href;
             const text = a.textContent.trim();
-            // Only include links with budget/finance related text or PDF links
             const lowerText = text.toLowerCase();
             const lowerHref = href.toLowerCase();
             if (
@@ -97,6 +95,32 @@ def extract_links_from_dom(nova, base_url: str) -> list[dict]:
     }""")
 
     return links or []
+
+
+def check_pdf_size(url: str) -> str:
+    """Do a HEAD request to get PDF file size. Returns human-readable size string."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        req.add_header("User-Agent", "BudgetCompass/1.0")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            length = resp.headers.get("Content-Length")
+            if length:
+                mb = int(length) / (1024 * 1024)
+                return f"{mb:.1f} MB"
+            # Follow redirect and check again
+            final_url = resp.url
+            if final_url != url:
+                req2 = urllib.request.Request(final_url, method="HEAD")
+                req2.add_header("User-Agent", "BudgetCompass/1.0")
+                with urllib.request.urlopen(req2, timeout=5) as resp2:
+                    length2 = resp2.headers.get("Content-Length")
+                    if length2:
+                        mb = int(length2) / (1024 * 1024)
+                        return f"{mb:.1f} MB"
+    except Exception:
+        pass
+    return ""
 
 
 def run_nova_act_search(city: str, state: str) -> dict:
@@ -126,13 +150,17 @@ def run_nova_act_search(city: str, state: str) -> dict:
         pdf_links = extract_links_from_dom(nova, target_url)
         steps.append(f"Found {len(pdf_links)} budget-related links on the page")
 
+        steps.append("Checking file sizes...")
         for link in pdf_links[:8]:
             url = link.get("url", "")
             title = link.get("title", "Budget Document")
-            # Clean up titles (remove extra whitespace)
             title = " ".join(title.split())
             if not title:
                 title = "Budget Document"
+
+            size = check_pdf_size(url)
+            if size:
+                title = f"{title} ({size})"
 
             results.append({
                 "title": title,
